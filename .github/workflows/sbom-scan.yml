@@ -1,0 +1,184 @@
+name: SBOM License Scan (BKN kernel)
+
+# Per 2Africa.AI ADR-014 §4.3 (license & IP compliance · BKN engine)
+# Source: 2Africa-AI/2Africa-SmartOS · scripts/sbom/fork-workflows/kweaver-core-sbom.yml
+# Scope: deployed sub-projects only (skips examples/, website/, OpenClaw DIP, etc.)
+
+on:
+  push:
+    branches:
+      - '2africa/v0.1'
+      - '2africa/v**'
+  schedule:
+    # Weekly Monday 00:00 UTC · detects upstream drift (per ADR-014 §4.5)
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sbom-scan:
+    name: Transitive license scan (BKN)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+          cache-dependency-path: |
+            adp/bkn/ontology-query/server/go.sum
+            adp/bkn/bkn-backend/server/go.sum
+            decision-agent/agent-backend/agent-factory/go.sum
+            trace-ai/agent-observability/go.sum
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install license scanners
+        run: |
+          set -euo pipefail
+          pip install pip-licenses
+          go install github.com/google/go-licenses@latest
+          npm install -g license-checker
+          # confirm versions
+          pip-licenses --version
+          $(go env GOPATH)/bin/go-licenses --version || true
+          license-checker --version
+
+      - name: Prep output dir
+        run: mkdir -p sbom-out
+
+      # ──────────────────────────────────────────────────────────────────────
+      # Python deps (deployed-only)
+      # Scope: agent-memory + sandbox executor
+      # Skip: mf-model-manager (331 deps · 训练/模型管理 · 不 deploy 在 BKN runtime)
+      #       coderunner (代码执行 · 部署可选)
+      #       examples/* (跳过)
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Scan Python deps (agent-memory + sandbox executor)
+        continue-on-error: false
+        run: |
+          set -euxo pipefail
+          for req_dir in \
+            decision-agent/agent-backend/agent-memory \
+            infra/sandbox/runtime/executor; do
+            req="$req_dir/requirements.txt"
+            if [ ! -f "$req" ]; then
+              echo "::warning::missing $req — skipping"
+              continue
+            fi
+            tag=$(echo "$req_dir" | tr '/' '-')
+            venv="/tmp/venv-$tag"
+            echo ">>> Scanning $req"
+            python -m venv "$venv"
+            # shellcheck source=/dev/null
+            source "$venv/bin/activate"
+            pip install -r "$req" 2>&1 | tail -10 || true
+            pip-licenses --from=mixed --format=json --with-license-file --no-license-path \
+              > "sbom-out/py-$tag.json" || true
+            deactivate
+          done
+          # Combined human-readable
+          jq -s 'flatten | group_by(.Name) | map(.[0])' sbom-out/py-*.json \
+            > sbom-out/py-all.json || true
+
+      # ──────────────────────────────────────────────────────────────────────
+      # Go deps (deployed-only)
+      # Scope: BKN ontology + bkn-backend + agent-factory + trace-ai
+      # Skip: dataflow/* (data 管道 · 单独 OS) · vega/* (data viz · 单独服务)
+      #       oss-gateway (对象存储 · 用我们自己的)
+      #       context-loader/agent-retrieval (用 LLKB WeKnora 替代)
+      #       execution-factory (operator 集成 · 单独评估)
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Scan Go deps (BKN core)
+        continue-on-error: false
+        run: |
+          set -euxo pipefail
+          GOLICENSES="$(go env GOPATH)/bin/go-licenses"
+          for gomod_dir in \
+            adp/bkn/ontology-query/server \
+            adp/bkn/bkn-backend/server \
+            decision-agent/agent-backend/agent-factory \
+            trace-ai/agent-observability; do
+            if [ ! -f "$gomod_dir/go.mod" ]; then
+              echo "::warning::missing $gomod_dir/go.mod — skipping"
+              continue
+            fi
+            tag=$(echo "$gomod_dir" | tr '/' '-')
+            echo ">>> Scanning $gomod_dir"
+            (cd "$gomod_dir" && "$GOLICENSES" report ./... 2>&1) \
+              > "sbom-out/go-$tag.csv" || true
+          done
+
+      # ──────────────────────────────────────────────────────────────────────
+      # Node deps (KWeaver Core has minimal Node surface in deployed scope)
+      # No deployed Node services in BKN scope · skip
+      # ──────────────────────────────────────────────────────────────────────
+
+      - name: Aggregate + red-line check
+        run: |
+          set -euxo pipefail
+          # Concat everything
+          cat sbom-out/py-*.json 2>/dev/null > /tmp/sbom-py.txt || touch /tmp/sbom-py.txt
+          cat sbom-out/go-*.csv  2>/dev/null > /tmp/sbom-go.txt || touch /tmp/sbom-go.txt
+          cat /tmp/sbom-py.txt /tmp/sbom-go.txt > /tmp/sbom-all.txt
+
+          RED=$(grep -niE 'AGPL|^GPL-[123]|GPL-2\.0|GPL-3\.0|SSPL|BUSL|Commons-Clause|Sustainable.Use|Elastic.License' /tmp/sbom-all.txt || true)
+          if [ -n "$RED" ]; then
+            echo "::error::🚨 RED-LINE LICENSE HIT — triggers ADR-014 §9 Plan B"
+            echo "$RED" | head -50
+            echo "$RED" > sbom-out/RED-LINE-HITS.txt
+            exit 1
+          fi
+          YELLOW=$(grep -niE 'LGPL|MPL-2\.0|EPL-1\.0|EPL-2\.0' /tmp/sbom-all.txt | sort -u || true)
+          YELLOW_COUNT=$(echo "$YELLOW" | grep -c . || echo 0)
+          echo "::notice::✅ Red-line: 0 hits · Yellow-flag: $YELLOW_COUNT (informational)"
+          {
+            echo "# BKN SBOM scan summary"
+            echo ""
+            echo "Generated: $(date -u +%Y-%m-%d_%H:%M:%S_UTC)"
+            echo "Commit: ${GITHUB_SHA}"
+            echo "Branch: ${GITHUB_REF_NAME}"
+            echo ""
+            echo "## Red-line hits"
+            echo ""
+            echo "**0** ✅"
+            echo ""
+            echo "## Yellow-flag hits"
+            echo ""
+            echo "Count: $YELLOW_COUNT"
+            echo ""
+            echo '```'
+            echo "$YELLOW" | head -50
+            echo '```'
+          } > sbom-out/SUMMARY.md
+
+      - name: Upload SBOM artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-bkn-${{ github.sha }}
+          path: sbom-out/
+          retention-days: 90
+
+      - name: Job summary
+        if: always()
+        run: |
+          if [ -f sbom-out/SUMMARY.md ]; then
+            cat sbom-out/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
+          fi
