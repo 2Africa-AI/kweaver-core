@@ -135,7 +135,18 @@ jobs:
           cat sbom-out/go-*.csv  2>/dev/null > /tmp/sbom-go.txt || touch /tmp/sbom-go.txt
           cat /tmp/sbom-py.txt /tmp/sbom-go.txt > /tmp/sbom-all.txt
 
-          RED=$(grep -niE 'AGPL|^GPL-[123]|GPL-2\.0|GPL-3\.0|SSPL|BUSL|Commons-Clause|Sustainable.Use|Elastic.License' /tmp/sbom-all.txt || true)
+          # Pre-process: 折叠 dual-license "(X OR Y)" · 若 X 或 Y 是 permissive 则选它 · 避 false-positive 红线
+          # e.g. "(MIT OR GPL-3.0-or-later)" → "MIT" (我们选 MIT)
+          sed -E 's/"\((MIT|Apache-2\.0|BSD-[23]-Clause|ISC|0BSD|CC0-1\.0|Unlicense)( OR [^)]+)\)"/"\1 (dual: chose permissive)"/gi' /tmp/sbom-all.txt > /tmp/sbom-c1.txt
+          sed -E 's/"\(([^()]+) OR (MIT|Apache-2\.0|BSD-[23]-Clause|ISC|0BSD|CC0-1\.0|Unlicense)\)"/"\2 (dual: chose permissive)"/gi' /tmp/sbom-c1.txt > /tmp/sbom-cleaned.txt
+          # Log dual-license cases we accepted (for transparency)
+          DUAL=$(grep 'dual: chose permissive' /tmp/sbom-cleaned.txt | sort -u | head -50 || true)
+          if [ -n "$DUAL" ]; then
+            DUAL_COUNT=$(echo "$DUAL" | grep -c . || echo 0)
+            echo "::notice::ℹ️ Dual-license packages accepted (picked permissive side): $DUAL_COUNT"
+            echo "$DUAL" > sbom-out/DUAL-LICENSE-ACCEPTED.txt
+          fi
+          RED=$(grep -niE 'AGPL|^GPL-[123]|GPL-2\.0|GPL-3\.0|SSPL|BUSL|Commons-Clause|Sustainable.Use|Elastic.License' /tmp/sbom-cleaned.txt || true)
           if [ -n "$RED" ]; then
             echo "::error::🚨 RED-LINE LICENSE HIT — triggers ADR-014 §9 Plan B"
             echo "$RED" | head -50
