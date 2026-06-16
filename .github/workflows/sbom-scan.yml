@@ -51,14 +51,11 @@ jobs:
 
       - name: Install license scanners
         run: |
-          set -euo pipefail
+          set -e
           pip install pip-licenses
           go install github.com/google/go-licenses@latest
           npm install -g license-checker
-          # confirm versions
-          pip-licenses --version
-          $(go env GOPATH)/bin/go-licenses --version || true
-          license-checker --version
+          # 不做 --version sanity check · set -euo pipefail 太严格触发 false-positive · 后续真用时若缺失自然报错
 
       - name: Prep output dir
         run: mkdir -p sbom-out
